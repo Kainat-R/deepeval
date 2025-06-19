@@ -1,10 +1,12 @@
 from typing import List, Union, Dict
-
+from loguru import logger
+import shlex
 from deepeval.metrics.indicator import metric_progress_indicator
 from deepeval.metrics.utils import (
     construct_verbose_logs,
     check_llm_test_case_params,
 )
+
 from deepeval.test_case import (
     LLMTestCase,
     LLMTestCaseParams,
@@ -13,7 +15,7 @@ from deepeval.test_case import (
     ToolCall,
 )
 from deepeval.metrics import BaseMetric
-
+from rouge_score import rouge_scorer
 
 class ToolCorrectnessMetric(BaseMetric):
 
@@ -41,14 +43,16 @@ class ToolCorrectnessMetric(BaseMetric):
         self.evaluation_params: List[ToolCallParams] = evaluation_params
         self.should_exact_match = should_exact_match
         self.should_consider_ordering = should_consider_ordering
+        self.rouge_scorer = rouge_scorer.RougeScorer(['rougeL'], use_stemmer=True)
 
     def measure(
         self,
-        test_case: LLMTestCase,
+        test_case: Union[LLMTestCase, ConversationalTestCase],
         _show_indicator: bool = True,
         _in_component: bool = False,
     ) -> float:
-
+        if isinstance(test_case, ConversationalTestCase):
+            test_case = test_case.turns[-1]
         check_llm_test_case_params(test_case, self._required_params, self)
         self.test_case = test_case
         with metric_progress_indicator(
@@ -251,22 +255,77 @@ class ToolCorrectnessMetric(BaseMetric):
                 i, j = i - 1, j - 1
         return lcs[::-1], total_score
 
+    def parse_command(self,cmd):
+        # print(repr(cmd))
+        cleaned_cmd = cmd.replace("'", " ")
+        tokens = shlex.split(cleaned_cmd.strip())
+        print(tokens)
+        parsed = {"command": None, "options": [], "args": []}
+
+        if tokens:
+            parsed["command"] = tokens[0]
+            for token in tokens[1:]:
+                if token.startswith("-") or token.startswith("|"):
+                    parsed["options"].append(token)
+                else:
+                    parsed["args"].append(token)
+
+        print(parsed)
+        return parsed
+
+    def normalize_command(self,cmd_str):
+        normalized_segments = []
+
+        parsed = self.parse_command(cmd_str.strip())
+        parts = []
+
+        if parsed["command"]:
+            parts.append(parsed["command"].lower())
+        # Sort options so order doesn't matter
+        parts.extend(sorted([opt.lower() for opt in parsed["args"]]))
+
+        normalized_segments.append(" ".join(parts))
+
+        return normalized_segments
     # For matching input parameters
     def _compare_dicts(self, dict1: Dict, dict2: Dict):
         if dict1 == dict2:
             return 1.0
+
         if self.should_exact_match:
             return 1.0 if dict1 == dict2 else 0.0
+
         match_score = 0
         matched_keys = set(dict1.keys()).intersection(set(dict2.keys()))
         total_keys = set(dict1.keys()).union(set(dict2.keys()))
+
         for key in matched_keys:
-            if dict1[key] == dict2[key]:
-                match_score += 1 / len(total_keys)
-            elif isinstance(dict1[key], dict) and isinstance(dict2[key], dict):
-                match_score += self._compare_dicts(
-                    dict1[key], dict2[key]
-                ) / len(total_keys)
+            val1, val2 = dict1[key], dict2[key]
+
+            # ✅ Normalize only for command-related keys
+            if key in {"command", "summary_command"}:
+                if isinstance(val1, str) and isinstance(val2, str):
+                    norm1 = self.normalize_command(val1)
+                    norm2 = self.normalize_command(val2)
+                    rouge = self.rouge_scorer.score(str(norm1), str(norm2))
+                    rouge_l = rouge['rougeL'].fmeasure
+                    print('rough1')
+                    print(rouge_l)
+                    match_score += (rouge_l / len(total_keys))
+                    continue  # Skip further checks for this key
+
+            if val1 == val2:
+                rouge = self.rouge_scorer.score(str(val1), str(val2))
+                rouge_l = rouge['rougeL'].fmeasure
+                print('rough1')
+                print(rouge_l)
+                match_score += (rouge_l / len(total_keys))
+
+            # ✅ Recursively compare nested dicts
+            elif isinstance(val1, dict) and isinstance(val2, dict):
+                match_score += self._compare_dicts(val1, val2) / len(total_keys)
+
+        print(match_score)
         return match_score
 
     ##################################################
